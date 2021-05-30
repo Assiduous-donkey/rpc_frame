@@ -1,261 +1,179 @@
 # geektutu ———— RPC框架GeeRPC学习
 
-## 服务注册
+## 超时处理
 
-服务注册指的是将结构体的方法映射为服务使得可以通过网络进行调用。
+实现方式就是异步执行原来的代码逻辑，通过channel传递代码块执行结束的信号，并设置计时器等待是否超时。
 
-### 结构体映射为服务
+在整个RPC过程中，需要客户端处理超时的地方有：
 
-对于```net/rpc```而言，一个函数可以被远程调用需要满足以下条件：
+1. 与服务端建立连接时超时
+2. 发送请求到服务端，在写报文时超时
+3. 等待服务端处理时，等待响应的超时
+4. 从服务端接收响应，在读报文时超时
 
-1. 函数所属类型是导出的（即可被非同一个package的程序调用）
-2. 函数是导出的
-3. 函数拥有两个入参且均为导出或内置类型
-4. 第二个入参必须为指针
-5. 函数只有一个返回值且为error类型
+需要服务端处理的超时有：
 
-```go
-    func (t *T) MethodName(argType T1, replyType *T2) error
-```
+1. 读取客户端请求，在读报文时超时
+2. 发送响应报文，在写报文时超时
+3. 调用映射服务的方法时超时
 
-客户端发送的请求包含了```ServiceMethod```，记录了请求要调用的结构体及其方法名。通过**反射**获取该结构体的所有方法以及方法的入参和返回值，再决定如何在服务端完成调用。
+### GeeRPC的超时处理机制
 
-```go
-    type methodType struct { // 存储一个方法的完整信息
-        method    reflect.Method
-        ArgType   reflect.Type
-        ReplyType reflect.Type
-    }
-```
+GeeRPC在三个地方添加了超时处理机制
 
-Go的反射提供了三种结构体Method、Type和Value，代表了方法、类型和值，并且包含了获取它们详细信息的接口，比如获取一个方法的参数类型、获取一个类型的名称等等。
+#### 客户端创建连接时
+
+在```Option```结构体中添加了```ConnectTimeout```字段用于表示客户端创建连接时的超时时间（0表示不做限制）。
 
 ```go
-    func (m *methodType) newArgv() reflect.Value {
-        var argv reflect.Value
-        // 服务参数可以是指针类型也可以是值类型
-        if m.ArgType.Kind() == reflect.Ptr {
-            argv = reflect.New(m.ArgType.Elem()) // 对于指针类型返回指针
-        } else {
-            argv = reflect.New(m.ArgType).Elem() // 非指针类型返回值类型 由Elem()获取
-        }
-        return argv
+    type clientResult struct {  // 用于channel传递客户端的创建结果
+        client *Client
+        err    error
     }
 
-    func (m *methodType) newReplyv() reflect.Value {
-        // 通过reflect.Elem()方法获取指针指向的元素类型
-        replyv := reflect.New(m.ReplyType.Elem())
-        switch m.ReplyType.Elem().Kind() {
-        case reflect.Map: // 申请内存 slice和map对象使用前都需要先申请内存
-            replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
-        case reflect.Slice:
-            replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
-        }
-        return replyv
-    }
-```
+    type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
-```newArgv()```方法和```newReplyv()```方法用于根据类型创建对应的参数和响应的实例，用于解码客户端请求的参数信息以及编码服务端返回的响应信息。
-
-1. ```reflect.New(Type) Value```：根据类型创建一个反射的值实例指针，相当于在平常的使用中我们有时会```new(int)```创建一个int类型的指针。
-2. ```Type.Elem()```：当Type为指针时，Elem()用于获取指针指向的元素类型
-3. ```Type.Kind()```：用于获取类型所属的大类，比如指针为一个大类```reflect.Ptr```，结构体为一个大类```reflect.Struct```
-4. ```Value.Set(Value)```：是Value直接的赋值操作，在上面的```newReplyv()```方法中被用于为map和slice类型的实例申请内存空间后赋值。
-
-```go
-    type service struct {
-        name   string                 // 映射的结构体名称
-        typ    reflect.Type           // 结构体类型
-        rcvr   reflect.Value          // 结构体的实例本身
-        method map[string]*methodType // 存储结构体所有可以映射为服务的方法
-    }
-```
-
-一个结构体对应一个服务，由于调用结构体方法时第一个参数（隐藏参数）为结构体实例本身，所以需要存储结构体实例本身```rcvr```。为了通过方法名查找方法然后调用，需要一个map来记录方法名和方法的映射关系。
-
-```go
-    // 入参是任意需要映射为服务的结构体实例
-    func newService(rcvr interface{}) *service {
-        s := new(service)
-        s.rcvr = reflect.ValueOf(rcvr)
-        s.name = reflect.Indirect(s.rcvr).Type().Name() // 若s.rcvr是指针则Indirect返回s.rcvr指向的值
-        s.typ = reflect.TypeOf(rcvr)
-        if !ast.IsExported(s.name) {
-            log.Fatalf("rpc server: %s is not a valid service name", s.name)
-        }
-        s.registerMethods()
-        return s
-    }
-```
-
-创建一个服务的操作实际上就是将一个结构体映射为服务，所以需要传递结构体实例```rcvr```进行构造。```registerMethods()```方法用于解析结构体包含的可被远程调用的方法
-
-```go
-    func (s *service) registerMethods() {
-        s.method = make(map[string]*methodType)
-        for i := 0; i < s.typ.NumMethod(); i++ {
-            method := s.typ.Method(i)
-            mType := method.Type // 方法的类型——函数类型，包含了函数参数和返回值等信息
-            // 可映射为服务的方法要求入参有三个（第一个默认为调用该方法的实例），返回值只有一个
-            if mType.NumIn() != 3 || mType.NumOut() != 1 {
-                continue
-            }
-            // 方法的返回值必须为error类型
-            if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
-                continue
-            }
-            argType, replyType := mType.In(1), mType.In(2)
-            // 两个入参，均为导出或内置类型
-            if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
-                continue
-            }
-            // 第二个入参必须为指针
-            if replyType.Kind() != reflect.Ptr {
-                continue
-            }
-            s.method[method.Name] = &methodType{
-                method:    method,
-                ArgType:   argType,
-                ReplyType: replyType,
-            }
-            log.Printf("rpc server: register %s.%s\n", s.name, method.Name)
-        }
-    }
-
-    func isExportedOrBuiltinType(t reflect.Type) bool {
-        // t.PkgPath()返回定义类型的包路径，对于内置类型返回的是空字符串
-        return ast.IsExported(t.Name()) || t.PkgPath() == ""
-    }
-```
-
-通过上述反射方法获取结构体的所有方法并检查是否满足可被远程调用的条件。
-
-1. ```Type.NumMethod()```：获取结构体的方法数量
-2. ```Type.Method(i)```：获取结构体的第i个方法
-3. ```Type.NumIn()```：Type为函数类型时获取该函数的入参数量，若函数为某个类型的方法则第一个参数为该类型的一个实例
-4. ```Type.NumOut()```：Type为函数类型时获取该函数的返回值数量
-5. ```Type.Out(i) Type```：获取函数的第i个返回值的类型（从0开始）
-6. ```Type.In(i) Type```：获取函数的第i个入参的类型（从0开始）
-
-```go
-    func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
-        f := m.method.Func
-        returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
-        if errInter := returnValues[0].Interface(); errInter != nil {
-            return errInter.(error)
-        }
-        return nil
-    }
-```
-
-通过反射值调用方法。```Method.Func```是该方法的函数实例，也是一个```reflect.Value```类型，第一个参数必须为方法所属类型的实例。调用```Value.Call```方法执行函数。由于```reflect.Value```类型没有直接转为```error```的结构所以先转为```interface```类型然后再转为```error```。
-
-### 服务端上注册服务
-
-```go
-    type Server struct {
-        serviceMap sync.Map // 存储结构体名以及对应的service对象
-    }
-
-    // 向server注册提供服务的结构体
-    func (server *Server) Register(rcvr interface{}) error {
-        s := newService(rcvr)
-        if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
-            return errors.New("rpc: service already defined: " + s.name)
-        }
-        return nil
-    }
-
-    func Register(rcvr interface{}) error {
-        return DefaultServer.Register(rcvr)
-    }
-```
-
-服务端提供一个线程安全的Map存储注册为服务的对象名以及对应的service对象。并提供对外的注册服务的接口，接受对象实例作为入参。
-
-```go
-    // 通过RPC调用的入参Service.Method解析得到对应的服务和方法
-    func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
-        dot := strings.LastIndex(serviceMethod, ".")
-        if dot < 0 {
-            err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
-            return
-        }
-        serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-        svci, ok := server.serviceMap.Load(serviceName)
-        if !ok {
-            err = errors.New("rpc server: can't find service " + serviceName)
-            return
-        }
-        svc = svci.(*service)
-        mtype = svc.method[methodName]
-        if mtype == nil {
-            err = errors.New("rpc server: can't find method " + methodName)
-        }
-        return
-    }
-```
-
-服务端需要通过请求包含的ServiceMethod来确定要调用的方法。ServiceMethod的格式为“Service.Method”，据此获取服务名和方法名检查是否存在。
-
-```go
-    type request struct {
-        h            *codec.Header
-        argv, replyv reflect.Value // 类型需要通过反射在运行时确定
-        mtype        *methodType   // 请求调用的方法信息
-        svc          *service      // 请求调用的服务——结构体信息
-    }
-```
-
-request作为辅助服务端处理请求的内部结构体，需要记录请求调用的服务信息和对应的方法信息。
-
-```go
-    func (server *Server) readRequest(cc codec.Codec) (*request, error) {
-        h, err := server.readRequestHeader(cc)
+    func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+        opt, err := parseOptions(opts...)
         if err != nil {
             return nil, err
         }
-        // 构建完整的请求消息结构
-        req := &request{h: h}
-        req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+        conn, err := net.DialTimeout(network, address, opt.ConnectTimeout) // 客户端连接建立是否超时
         if err != nil {
-            return req, err
+            return nil, err
         }
-        req.argv = req.mtype.newArgv()
-        req.replyv = req.mtype.newReplyv()
+        defer func() {
+            if err != nil {
+                _ = conn.Close()
+            }
+        }()
+        // newClientFunc的执行是否超时（包括了发送编码方法给服务端）
+        ch := make(chan clientResult)
+        go func() {
+            client, err := f(conn, opt)
+            ch <- clientResult{client: client, err: err}
+        }()
+        if opt.ConnectTimeout == 0 {    // 不限制时间
+            result := <-ch
+            return result.client, result.err
+        }
+        select {
+        case <-time.After(opt.ConnectTimeout):
+            return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+        case result := <-ch:
+            return result.client, result.err
+        }
+    }
 
-        argvi := req.argv.Interface() // argvi必须为指针类型才能通过codec.ReadBody方法获取报文正文信息
-        if req.argv.Type().Kind() != reflect.Ptr {
-            argvi = req.argv.Addr().Interface()
-        }
-        if err = cc.ReadBody(argvi); err != nil {
-            log.Println("rpc server: read argv err: ", err)
-            return req, err
-        }
-        return req, nil
+    func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+        return dialTimeout(NewClient, network, address, opts...)
     }
 ```
 
-在读取请求信息时首先读请求头获取ServiceMethod然后据此查找服务信息和方法信息，再通过方法的参数和响应类型创建对应的实例。参数实例用于读取请求报文的正文。
+包括检查两部分逻辑是否超时。一部分是根据通信方式和地址建立与服务端的连接，采用了```net.DialTimeout```方法，将```Option.ConnectTimeout```作为参数。另一部分是创建客户端结构体的时间，包括与服务端协商报文编码方式以及构造```Client```结构体。
+
+#### 客户端执行Call方法时
 
 ```go
-    func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+    // 同步RPC调用 使用context由用户控制RPC调用的超时时间
+    func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+        // 阻塞等待调用完成
+        call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+        select {
+        case <-ctx.Done():
+            client.removeCall(call.Seq)
+            return errors.New("rpc client: call failed: " + ctx.Err().Error())
+        case call := <-call.Done:
+            return call.Error
+        }
+    }
+```
+
+在客户端执行RPC的方法```Call```新增参数```ctx context.Context```，将客户端要求的RPC超时时间的设置权交给用户。用户可以通过```context.WithTimeout```方法创建携带超时时间的```context.Context```。在```client.Call```中，执行为异步调用后监听是否超时，是的话从客户端中移除掉本次调用的信息。
+
+在此处添加超时处理机制，处理的情况包括了客户端发送报文超时、等待响应超时、处理响应超时，相当于要求客户端发送报文的时间+等待响应的时间+处理响应的时间小于用户设置的超时时间。
+
+#### 服务端处理请求时
+
+```go
+    /* ************************************
+                作者的版本
+    ************************************ */
+    func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
+        defer wg.Done()
+        called := make(chan struct{})
+        sent := make(chan struct{})
+        go func() {
+            err := req.svc.call(req.mtype, req.argv, req.replyv)
+            called <- struct{}{}
+            if err != nil {
+                req.h.Error = err.Error()
+                server.sendResponse(cc, req.h, invalidRequest, sending)
+                sent <- struct{}{}
+                return
+            }
+            server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+            sent <- struct{}{}
+        }()
+
+        if timeout == 0 {
+            <-called
+            <-sent
+            return
+        }
+        select {
+        case <-time.After(timeout):
+            req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+            server.sendResponse(cc, req.h, invalidRequest, sending)
+        case <-called:
+            <-sent
+        }
+    }
+```
+
+**这个地方作者的逻辑有goroutine泄露的风险**。
+原版代码采用了```called```和```sent```两个channel来传递调用方法结束的信号和发送响应的信号，由于```called```是无缓冲channel，所以当调用超时，即满足```<-time.After(timeout)```这个case时，函数```handleRequest```很快执行完成，而其开启的goroutine还未执行完，等到该gouroutine执行完调用的方法后要传递信号```called <- struct{}{}```时已经没有```called```这个通道的接收者，因此该goroutine会阻塞在这行代码，无法释放，从而导致goroutine泄露。
+
+**采用带缓冲的channel可以解决这个问题**。
+即使超时，上述goroutine在执行完调用的方法后也能向```called```通道写入信号（因为该通道带缓存），但后续发送响应后执行的```sent <- struct{}{}```一样会阻塞。所以我修改了这部分的逻辑，代码如下：
+
+```go
+    /* ************************************
+                我的版本
+    ************************************ */
+    func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
         // 等待同一个连接的多个请求处理完再关闭连接
         defer wg.Done()
 
-        err := req.svc.call(req.mtype, req.argv, req.replyv) // 调用RPC方法
-        if err != nil {
-            req.h.Error = err.Error()
-            server.sendResponse(cc, req.h, invalidRequest, sending)
+        // called设置为带缓存的channel 是为了防止超时情况下下面的goroutine阻塞在called<-struct{}{}导致无法退出 因为此时主函数已经退出
+        called := make(chan error, 1) // 传递RPC调用结束信号
+        go func() {
+            err := req.svc.call(req.mtype, req.argv, req.replyv) // 调用RPC方法
+            called <- err
+        }()
+
+        if timeout == 0 { // 不限制是否超时
+            if err := <-called; err != nil {
+                req.h.Error = err.Error()
+                server.sendResponse(cc, req.h, invalidRequest, sending)
+            } else {
+                server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+            }
             return
         }
-
-        server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+        select {
+        case <-time.After(timeout):
+            req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+            server.sendResponse(cc, req.h, invalidRequest, sending)
+        case err := <-called:
+            if err != nil {
+                req.h.Error = err.Error()
+                server.sendResponse(cc, req.h, invalidRequest, sending)
+            } else {
+                server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+            }
+        }
     }
 ```
 
-请求的处理直接调用了服务的call方法。
-
-### 与用户交互
-
-用户通过```geerpc.Register(对象实例)```将对象注册为可提供RPC服务的对象，然后监听指定的通信端口。客户端向服务端的监听端口建立连接后，通过客户端的Call方法进行RPC调用。
+将```called```通道用于传递调用执行完成的信号并携带调用结果，去掉```sent```通道，根据调用结果决定发送的响应。虽然这种写法会有部分代码重复，但可以解决上述问题。

@@ -3,6 +3,7 @@ package geerpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"geerpc/codec"
 	"io"
 	"log"
@@ -10,18 +11,22 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 type Option struct { // 存储消息编码方式，固定采用JSON编码Option置于报文头部
-	MagicNumber int
-	CodecType   codec.Type // 编码类型
+	MagicNumber    int
+	CodecType      codec.Type // 编码类型
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration // 0 表示不设限制
 }
 
 var DefaultOption = &Option{ // 默认使用Gob编码
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 type Server struct {
@@ -65,7 +70,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
-	server.serveCodec(f(conn)) // 处理报文信息
+	server.serveCodec(f(conn), &opt) // 处理报文信息
 }
 
 var invalidRequest = struct{}{} // 发生错误时响应的占位符
@@ -73,7 +78,7 @@ var invalidRequest = struct{}{} // 发生错误时响应的占位符
 // 分三个阶段：读取请求、处理请求、回复请求
 // 一次连接允许接收多个请求
 // 回复请求的报文必须逐个发送，因为并发容易导致多个回复报文交织在一起
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup) // 处理完所有请求后再关闭连接
 	for {
@@ -87,7 +92,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -147,18 +152,38 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// 等待同一个连接的多个请求处理完再关闭连接
 	defer wg.Done()
 
-	err := req.svc.call(req.mtype, req.argv, req.replyv) // 调用RPC方法
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	// called设置为带缓存的channel 是为了防止超时情况下下面的goroutine阻塞在called<-struct{}{}导致无法退出 因为此时主函数已经退出
+	called := make(chan error, 1) // 传递RPC调用结束信号
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv) // 调用RPC方法
+		called <- err
+	}()
+
+	if timeout == 0 { // 不限制是否超时
+		if err := <-called; err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+		} else {
+			server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		}
 		return
 	}
-
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case err := <-called:
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+		} else {
+			server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		}
+	}
 }
 
 /* ****************************

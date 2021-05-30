@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"geerpc"
 	"log"
 	"net"
@@ -71,7 +72,8 @@ func rpcDemo() {
 			defer wg.Done()
 			args := &Args{Num1: i, Num2: i * i}
 			var reply int
-			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+			ctx, _ := context.WithTimeout(context.Background(), time.Second)
+			if err := client.Call(ctx, "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error: ", err)
 			}
 			log.Printf("%d + %d = %d\n", args.Num1, args.Num2, reply)
@@ -80,7 +82,28 @@ func rpcDemo() {
 	wg.Wait()
 }
 
+func chDemo() {
+	ch := make(chan struct{}, 1)
+	go func() {
+		time.Sleep(time.Second * 3)
+		ch <- struct{}{}
+		log.Println("ch<-struct{}{} done")
+	}()
+	select {
+	case <-time.After(time.Second):
+		log.Println("timeout")
+	case <-ch:
+		log.Println("<-ch done")
+	}
+	// time.Sleep(time.Second * 5)
+}
+
 func main() {
 	// reflectDemo()
-	rpcDemo()
+	// rpcDemo()
+	// defer func() {
+	// 	fmt.Println("the number of goroutines: ", runtime.NumGoroutine())
+	// }()
+	// chDemo()
+	// time.Sleep(time.Second * 5)
 }
