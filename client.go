@@ -170,7 +170,7 @@ func parseOptions(opts ...*Option) (*Option, error) {
 
 // 创建客户端的入口 一个客户端只处理一个连接(address)的信息
 // network：通信方式TCP/UDP
-func Dail(network, address string, opts ...*Option) (client *Client, err error) {
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
@@ -180,7 +180,7 @@ func Dail(network, address string, opts ...*Option) (client *Client, err error) 
 		return nil, err
 	}
 	defer func() {
-		if client == nil { // 创建客户端失败则关闭net.Dail建立的连接
+		if err != nil { // 创建客户端失败则关闭net.Dial建立的连接
 			_ = conn.Close()
 		}
 	}()
