@@ -5,6 +5,7 @@ import (
 	"geerpc"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -42,25 +43,34 @@ func (f Foo) Sum(args Args, reply *int) error {
 	return nil
 }
 
+type Yang int
+
+func (y Yang) Sub(args Args, reply *int) error {
+	*reply = args.Num2 - args.Num1
+	return nil
+}
+
 func startServer(addr chan string) {
 	var foo Foo
-	if err := geerpc.Register(foo); err != nil {
-		log.Fatal("register error: ", err)
-	}
-
-	l, err := net.Listen("tcp", ":8000")
+	var yang Yang
+	l, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		log.Fatal("network error: ", err)
 	}
+	if err := geerpc.Register(foo); err != nil {
+		log.Fatal("register error: ", err)
+	}
+	if err := geerpc.Register(yang); err != nil {
+		log.Fatal("register error: ", err)
+	}
+	geerpc.HandleHTTP()
 	log.Println("start rpc server on", l.Addr())
 	addr <- l.Addr().String()
-	geerpc.Accept(l)
+	_ = http.Serve(l, nil)
 }
 
-func rpcDemo() {
-	addr := make(chan string)
-	go startServer(addr)
-	client, _ := geerpc.Dial("tcp", <-addr)
+func call(addr chan string) {
+	client, _ := geerpc.DialHTTP("tcp", <-addr)
 	defer client.Close()
 
 	time.Sleep(time.Second)
@@ -72,38 +82,26 @@ func rpcDemo() {
 			defer wg.Done()
 			args := &Args{Num1: i, Num2: i * i}
 			var reply int
-			ctx, _ := context.WithTimeout(context.Background(), time.Second)
-			if err := client.Call(ctx, "Foo.Sum", args, &reply); err != nil {
+			// ctx, _ := context.WithTimeout(context.Background(), time.Second)
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error: ", err)
 			}
 			log.Printf("%d + %d = %d\n", args.Num1, args.Num2, reply)
+			if err := client.Call(context.Background(), "Yang.Sub", args, &reply); err != nil {
+				log.Fatal("call Foo.Sum error: ", err)
+			}
+			log.Printf("%d - %d = %d\n", args.Num2, args.Num1, reply)
 		}(i)
 	}
 	wg.Wait()
 }
 
-func chDemo() {
-	ch := make(chan struct{}, 1)
-	go func() {
-		time.Sleep(time.Second * 3)
-		ch <- struct{}{}
-		log.Println("ch<-struct{}{} done")
-	}()
-	select {
-	case <-time.After(time.Second):
-		log.Println("timeout")
-	case <-ch:
-		log.Println("<-ch done")
-	}
-	// time.Sleep(time.Second * 5)
+func rpcDemo() {
+	addr := make(chan string)
+	go call(addr)
+	startServer(addr)
 }
 
 func main() {
-	// reflectDemo()
-	// rpcDemo()
-	// defer func() {
-	// 	fmt.Println("the number of goroutines: ", runtime.NumGoroutine())
-	// }()
-	// chDemo()
-	// time.Sleep(time.Second * 5)
+	rpcDemo()
 }

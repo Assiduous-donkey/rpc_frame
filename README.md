@@ -1,179 +1,232 @@
 # geektutu ———— RPC框架GeeRPC学习
 
-## 超时处理
+## 支持HTTP协议
 
-实现方式就是异步执行原来的代码逻辑，通过channel传递代码块执行结束的信号，并设置计时器等待是否超时。
+支持HTTP协议是为了可以提供除了RPC调用之外的服务，比如可以基于HTTP实现一个简单的Debug页面统计已注册的服务及其调用次数。
 
-在整个RPC过程中，需要客户端处理超时的地方有：
+### HTTP的CONNECT方法
 
-1. 与服务端建立连接时超时
-2. 发送请求到服务端，在写报文时超时
-3. 等待服务端处理时，等待响应的超时
-4. 从服务端接收响应，在读报文时超时
+CONNECT方法一般用于代理服务。
+假设浏览器（**也就是客户端**）与服务器之间采用HTTPS加密通信，浏览器通过代理服务器发起HTTPS请求时，由于请求的站点地址和端口号都是加密的，代理服务器不知道该往哪里转发这个请求。为了解决这个问题，浏览器可以先通过HTTP协议明文**向代理服务器发送一个CONNECT请求**告诉代理服务器目标地址和端口，代理服务器收到这个请求后会与目标站点建立一个TCP连接，用于转发接下来浏览器发送给站点的加密报文。
+这一过程可以看作是通过向代理服务器发送CONNECT请求，实现了将HTTP协议转为HTTPS协议的过程。后续客户端-服务器之间的通信全为HTTPS协议。
 
-需要服务端处理的超时有：
+由于RPC的消息格式和标准的HTTP协议不兼容，要支持HTTP协议则需要一个协议的转换过程。可以采用HTTP协议的CONNECT方法来实现。
 
-1. 读取客户端请求，在读报文时超时
-2. 发送响应报文，在写报文时超时
-3. 调用映射服务的方法时超时
+### 服务端支持HTTP协议
 
-### GeeRPC的超时处理机制
-
-GeeRPC在三个地方添加了超时处理机制
-
-#### 客户端创建连接时
-
-在```Option```结构体中添加了```ConnectTimeout```字段用于表示客户端创建连接时的超时时间（0表示不做限制）。
+对于RPC服务端来说，支持HTTP协议要求客户端可以通过HTTP协议与服务端建立连接，但建立连接之后的数据传输则需采用RPC服务端自定义的协议。
 
 ```go
-    type clientResult struct {  // 用于channel传递客户端的创建结果
-        client *Client
-        err    error
-    }
+    /* **************************************************
+    支持HTTP协议相关
+    *************************************************** */
+    const (
+        connected        = "200 Connected to Gee RPC"
+        defaultRPCPath   = "/_geerpc_"      // 提供rpc通信的HTTP服务
+        defaultDebugPath = "/debug/geerpc"  // 提供debug服务
+    )
 
-    type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
-
-    func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
-        opt, err := parseOptions(opts...)
-        if err != nil {
-            return nil, err
-        }
-        conn, err := net.DialTimeout(network, address, opt.ConnectTimeout) // 客户端连接建立是否超时
-        if err != nil {
-            return nil, err
-        }
-        defer func() {
-            if err != nil {
-                _ = conn.Close()
-            }
-        }()
-        // newClientFunc的执行是否超时（包括了发送编码方法给服务端）
-        ch := make(chan clientResult)
-        go func() {
-            client, err := f(conn, opt)
-            ch <- clientResult{client: client, err: err}
-        }()
-        if opt.ConnectTimeout == 0 {    // 不限制时间
-            result := <-ch
-            return result.client, result.err
-        }
-        select {
-        case <-time.After(opt.ConnectTimeout):
-            return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
-        case result := <-ch:
-            return result.client, result.err
-        }
-    }
-
-    func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-        return dialTimeout(NewClient, network, address, opts...)
-    }
-```
-
-包括检查两部分逻辑是否超时。一部分是根据通信方式和地址建立与服务端的连接，采用了```net.DialTimeout```方法，将```Option.ConnectTimeout```作为参数。另一部分是创建客户端结构体的时间，包括与服务端协商报文编码方式以及构造```Client```结构体。
-
-#### 客户端执行Call方法时
-
-```go
-    // 同步RPC调用 使用context由用户控制RPC调用的超时时间
-    func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-        // 阻塞等待调用完成
-        call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
-        select {
-        case <-ctx.Done():
-            client.removeCall(call.Seq)
-            return errors.New("rpc client: call failed: " + ctx.Err().Error())
-        case call := <-call.Done:
-            return call.Error
-        }
-    }
-```
-
-在客户端执行RPC的方法```Call```新增参数```ctx context.Context```，将客户端要求的RPC超时时间的设置权交给用户。用户可以通过```context.WithTimeout```方法创建携带超时时间的```context.Context```。在```client.Call```中，执行为异步调用后监听是否超时，是的话从客户端中移除掉本次调用的信息。
-
-在此处添加超时处理机制，处理的情况包括了客户端发送报文超时、等待响应超时、处理响应超时，相当于要求客户端发送报文的时间+等待响应的时间+处理响应的时间小于用户设置的超时时间。
-
-#### 服务端处理请求时
-
-```go
-    /* ************************************
-                作者的版本
-    ************************************ */
-    func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
-        defer wg.Done()
-        called := make(chan struct{})
-        sent := make(chan struct{})
-        go func() {
-            err := req.svc.call(req.mtype, req.argv, req.replyv)
-            called <- struct{}{}
-            if err != nil {
-                req.h.Error = err.Error()
-                server.sendResponse(cc, req.h, invalidRequest, sending)
-                sent <- struct{}{}
-                return
-            }
-            server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-            sent <- struct{}{}
-        }()
-
-        if timeout == 0 {
-            <-called
-            <-sent
+    func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+        if req.Method != "CONNECT" {    // 该服务只接收客户端的CONNECT请求 用于建立连接
+            w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+            w.WriteHeader(http.StatusMethodNotAllowed)
+            _, _ = io.WriteString(w, "405 must CONNECT\n")
             return
         }
-        select {
-        case <-time.After(timeout):
-            req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
-            server.sendResponse(cc, req.h, invalidRequest, sending)
-        case <-called:
-            <-sent
-        }
-    }
-```
-
-**这个地方作者的逻辑有goroutine泄露的风险**。
-原版代码采用了```called```和```sent```两个channel来传递调用方法结束的信号和发送响应的信号，由于```called```是无缓冲channel，所以当调用超时，即满足```<-time.After(timeout)```这个case时，函数```handleRequest```很快执行完成，而其开启的goroutine还未执行完，等到该gouroutine执行完调用的方法后要传递信号```called <- struct{}{}```时已经没有```called```这个通道的接收者，因此该goroutine会阻塞在这行代码，无法释放，从而导致goroutine泄露。
-
-**采用带缓冲的channel可以解决这个问题**。
-即使超时，上述goroutine在执行完调用的方法后也能向```called```通道写入信号（因为该通道带缓存），但后续发送响应后执行的```sent <- struct{}{}```一样会阻塞。所以我修改了这部分的逻辑，代码如下：
-
-```go
-    /* ************************************
-                我的版本
-    ************************************ */
-    func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
-        // 等待同一个连接的多个请求处理完再关闭连接
-        defer wg.Done()
-
-        // called设置为带缓存的channel 是为了防止超时情况下下面的goroutine阻塞在called<-struct{}{}导致无法退出 因为此时主函数已经退出
-        called := make(chan error, 1) // 传递RPC调用结束信号
-        go func() {
-            err := req.svc.call(req.mtype, req.argv, req.replyv) // 调用RPC方法
-            called <- err
-        }()
-
-        if timeout == 0 { // 不限制是否超时
-            if err := <-called; err != nil {
-                req.h.Error = err.Error()
-                server.sendResponse(cc, req.h, invalidRequest, sending)
-            } else {
-                server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-            }
+        // 使用Hijack()获取HTTP连接中的TCP连接 由调用者自己管理 此后只能从conn读写数据
+        conn, _, err := w.(http.Hijacker).Hijack()
+        if err != nil {
+            log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
             return
         }
-        select {
-        case <-time.After(timeout):
-            req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
-            server.sendResponse(cc, req.h, invalidRequest, sending)
-        case err := <-called:
-            if err != nil {
-                req.h.Error = err.Error()
-                server.sendResponse(cc, req.h, invalidRequest, sending)
-            } else {
-                server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-            }
-        }
+        // 表示连接已经建立
+        _, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")   // 客户端收到时会将协议版本后面的内容作为完整的响应内容
+        server.ServeConn(conn)  // RPC协议进行通信
+    }
+
+    func (server *Server) HandleHTTP() {
+        http.Handle(defaultRPCPath, server)
+        http.Handle(defaultDebugPath, debugHTTP{server})
+        log.Println("rpc server debug path:", defaultDebugPath)
+    }
+
+    func HandleHTTP() {
+        DefaultServer.HandleHTTP()
     }
 ```
 
-将```called```通道用于传递调用执行完成的信号并携带调用结果，去掉```sent```通道，根据调用结果决定发送的响应。虽然这种写法会有部分代码重复，但可以解决上述问题。
+Go语言的http标准库里有一个接口类型```Handler```定义了方法```ServeHTTP(w ResponseWriter, r *Request)```，实现了该方法的类型可以作为一个Handler处理HTTP请求。上面代码中，```Server```实现了该方法用于处理HTTP请求，并通过```http.Handle(pattern string, handler Handler)```将Server与“/_geerpc_”这个URL绑定起来。因此，当客户端通过HTTP连接访问/_geerpc_时就会执行```Server.ServeHTTP```这个方法。
+
+```Server.ServeHTTP```方法用于RPC服务端和RPC客户端建立RPC通信。客户端会通过HTTP协议发送CONNECT请求。服务端只接收CONNECT请求，并通过```Hijack()```方法获取HTTP连接中的TCP连接，将该TCP连接交给RPC服务端管理，**这里便是实现了HTTP协议到RPC协议的转换**。因为得到TCP连接后，服务端根据自定义的RPC协议通过该TCP连接发送RPC报文。
+
+### 客户端支持HTTP协议
+
+对于RPC客户端来说，支持HTTP协议要求客户端能通过HTTP协议与服务端建立连接。所以需要在客户端新增通过HTTP的CONNECT请求建立连接的逻辑。
+
+```go
+    func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+        // HTTP请求报文第一行为请求行，请求行格式：请求方法 URL 协议版本
+        // 直接构造HTTP报文的格式 向连接conn发送，CONNECT请求
+        _, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+        // 接收服务端对CONNECT请求的响应
+        resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+        if err == nil && resp.Status == connected { // Status存储了响应信息 不包括协议版本
+            return NewClient(conn, opt)
+        }
+        if err == nil {
+            err = errors.New("unexpected HTTP response: " + resp.Status)
+        }
+        return nil, err
+    }
+
+    func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+        return dialTimeout(NewHTTPClient, network, address, opts...)
+    }
+```
+
+创建客户端时仍然延续之前的逻辑，先通过```net.DialTimeout```建立连接，再通过新增的```NewHTTPClient```方法创建一个支持HTTP协议的客户端。
+客户端首先需要向服务器发送CONNECT请求，基于HTTP请求报文的格式，报文第一行为请求行，包括请求方法、URL、版本号（由空格隔开）。因此直接构造CONNECT请求报文发送给服务器```io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))```。
+服务器确认是CONNECT请求后会返回可以建立连接的响应：```io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")```。客户端采用```http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})```读取之前发送的CONNECT请求的响应，检查是否能够创建客户端。
+
+在此处，HTTP协议只是用于前期建立连接。可以看作是把服务器处理RPC调用的功能作为一个HTTP服务。
+
+## 基于HTTP实现一个简单的Debug页面
+
+这个页面用于统计已注册的服务及其调用次数，也是为了印证支持HTTP协议可以使服务器提供更多功能。
+
+```go
+    const debugText = `<html>
+        <body>
+        <title>GeeRPC Services</title>
+        {{range .}}
+        <hr>
+        Service {{.Name}}
+        <hr>
+            <table>
+            <th align=center> Method</th><th align=center> Calls</th>
+            {{range $name, $mtype := .Method}}
+                <tr>
+                <td align=left front=fixed>{{$name}}({{$mtype.ArgType}}, {{$mtype.ReplyType}}) error</td>
+                <td align=center>{{$mtype.NumCalls}}</td>
+                </tr>
+            {{end}}
+            </table>
+        {{end}}
+        </body>
+        </html>`
+
+    var debug = template.Must(template.New("RPC debug").Parse(debugText))
+
+    type debugService struct {
+        Name   string
+        Method map[string]*methodType
+    }
+```
+
+页面包括了前端展示部分，Go的内置库```html/template```提供了这种功能。
+首先定义了html模板，该模板展示了已注册到服务器上的类型、类型提供的可被远程调用的方法以及方法对应的调用次数。要展示的数据是上面代码中的```debugService```数组。因此模板中的```.Name```对应了```debugService.Name```，```.Method```对应了```debugService.Method```。
+通过```template.New```创建一个模板，再由```Template.Parse(模板内容)```解析模板得到一个可展示的html模板。```template.Must```函数只是一个检查是否出错的辅助函数。
+
+```go
+    type debugHTTP struct {
+        *Server
+    }
+
+    func (server debugHTTP) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+        var services []debugService
+        server.serviceMap.Range(func(namei, svci interface{}) bool { // Range用于遍历syncMap并对每个键值对执行作为参数的函数
+            svc := svci.(*service)
+            services = append(services, debugService{
+                Name:   namei.(string),
+                Method: svc.method,
+            })
+            return true
+        })
+        err := debug.Execute(w, services)
+        if err != nil {
+            _, _ = fmt.Fprintln(w, "rpc: error executing template: ", err.Error())
+        }
+    }
+
+    func (server *Server) HandleHTTP() {
+        http.Handle(defaultRPCPath, server)
+        http.Handle(defaultDebugPath, debugHTTP{server})
+        log.Println("rpc server debug path:", defaultDebugPath)
+    }
+```
+
+```debugHTTP```结构体实现了```ServeHTTP```方法，因此可以处理HTTP请求。该方法的实际作用是获取RPC服务器上已注册的服务并展示。通过```debug.Execute(w, services)```将数据以网页的形式展示出来。
+
+## 交互方式
+
+```go
+    type Args struct{ Num1, Num2 int }
+
+    type Foo int
+    func (f Foo) Sum(args Args, reply *int) error {
+        *reply = args.Num1 + args.Num2
+        return nil
+    }
+
+    type Yang int
+    func (y Yang) Sub(args Args, reply *int) error {
+        *reply = args.Num2 - args.Num1
+        return nil
+    }
+
+    func startServer(addr chan string) {
+        var foo Foo
+        var yang Yang
+        l, err := net.Listen("tcp", ":9999")
+        if err != nil {
+            log.Fatal("network error: ", err)
+        }
+        if err := geerpc.Register(foo); err != nil {
+            log.Fatal("register error: ", err)
+        }
+        if err := geerpc.Register(yang); err != nil {
+            log.Fatal("register error: ", err)
+        }
+        geerpc.HandleHTTP()     // 注册HTTP服务
+        addr <- l.Addr().String()
+        _ = http.Serve(l, nil)  // 监听并处理HTTP服务
+    }
+
+    func call(addr chan string) {
+        client, _ := geerpc.DialHTTP("tcp", <-addr)
+        defer client.Close()
+
+        time.Sleep(time.Second)
+
+        var wg sync.WaitGroup
+        for i := 0; i < 5; i++ {
+            wg.Add(1)
+            go func(i int) {
+                defer wg.Done()
+                args := &Args{Num1: i, Num2: i * i}
+                var reply int
+                if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
+                    log.Fatal("call Foo.Sum error: ", err)
+                }
+                log.Printf("%d + %d = %d\n", args.Num1, args.Num2, reply)
+                if err := client.Call(context.Background(), "Yang.Sub", args, &reply); err != nil {
+                    log.Fatal("call Foo.Sum error: ", err)
+                }
+                log.Printf("%d - %d = %d\n", args.Num2, args.Num1, reply)
+            }(i)
+        }
+        wg.Wait()
+    }
+
+    func rpcDemo() {
+        addr := make(chan string)
+        go call(addr)
+        startServer(addr)
+    }
+```
+
+注册了两个RPC服务，服务器通过```geerpc.HandleHTTP()```注册HTTP服务，包括提供RPC功能的服务和获取debug页面的服务，同时通过9999端口监听HTTP服务。
+客户端通过```geerpc.DialHTTP```建立与服务器的连接，此后仍然采用```Call```方法进行RPC调用。
+
+debug页面效果如下图：
+![debug](debug_show.png)
