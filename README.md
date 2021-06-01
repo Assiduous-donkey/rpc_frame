@@ -1,22 +1,132 @@
 # geektutu ———— RPC框架GeeRPC学习
 
-## 负载均衡与服务发现
+## 服务发现与注册中心
 
-负载均衡的前提是有个服务器实例。选择哪个实例进行调用需要基于服务发现模块。
+有了注册中心之后，客户端和服务端只需要感知注册中心的存在即可。
+服务端启动后向注册中心发送注册消息，注册中心得知该服务已经启动，处于可用状态。一般来说，服务端还需要定期向注册中心发送心跳证明自己仍然有效。
+客户端向注册中心查询可用的服务实例，注册中心会将所有可用的服务实例返回给客户端，由客户端根据自身的负载均衡策略选择一个实例进行调用。
+
+### 简单的支持心跳的注册中心
 
 ```go
-    type SelectMode int // 表示不同的负载均衡策略
+    /* 注册中心 */
+    type GeeRegistry struct {
+        timeout time.Duration // 服务超时时间 默认为5分钟
+        mu      sync.Mutex
+        servers map[string]*ServerItem
+    }
+
+    type ServerItem struct { // 服务实例
+        Addr  string
+        start time.Time // 用于检查服务是否超时
+    }
 
     const (
-        RandomSelect     SelectMode = iota // 随机选择
-        RoundRobinSelect                   // 轮询
+        defaultPath    = "/_geerpc_/registry"
+        defaultTimeout = time.Minute * 5
     )
+```
 
-    type Discovery interface {
-        Refresh() error                      // 从注册中心更新服务列表
-        Update(servers []string) error       // 手动更新服务列表
-        Get(mode SelectMode) (string, error) // 根据负载均衡策略选择一个服务实例
-        GetAll() ([]string, error)           // 获取所有服务实例
+一个注册中心```GeeRegistry```包括了表示服务超时时间的```timeout```，超时后服务不可用除非再次注册到注册中心。```ServerItem.start```用于记录服务实例注册到注册中心的时间。注册中心通过HTTP协议与服务端和客户端交互，采用```/_geerpc_/registry```作为URL。
+
+```go
+    // 添加服务实例
+    func (r *GeeRegistry) putServer(addr string) {
+        r.mu.Lock()
+        defer r.mu.Unlock()
+        s := r.servers[addr]
+        if s == nil {
+            r.servers[addr] = &ServerItem{Addr: addr, start: time.Now()}
+        } else {
+            s.start = time.Now()    // 重置注册时间
+        }
+    }
+
+    // 返回可用的服务列表
+    func (r *GeeRegistry) aliveServers() []string {
+        r.mu.Lock()
+        defer r.mu.Unlock()
+        var alive []string
+        for addr, s := range r.servers {
+            // r.timeout = 0 表示不限制服务超时时间
+            if r.timeout == 0 || s.start.Add(r.timeout).After(time.Now()) {
+                alive = append(alive, addr)
+            } else {
+                delete(r.servers, addr)
+            }
+        }
+        sort.Strings(alive) // 这里排序是为了让客户端实现有效的负载均衡 比如轮询
+        return alive
+    }
+```
+
+注册中心有两个基础的操作：添加服务实例和返回可用的服务列表。通过```s.start.Add(r.timeout).After(time.Now())```检查是否注册超时。获取可用服务列表后对服务实例的地址做了排序处理，是为了在可用服务实例不变的情况下保证每次返回的[]string中元素的值和顺序一样。保证客户端获取到可用的服务实例后进行的负载均衡选择可靠。
+
+```go
+    func (r *GeeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+        switch req.Method {
+        case "GET": // GET返回所有可用的服务实例列表 承载在HTTP Header中 —— X-Geerpc-Servers
+            w.Header().Set("X-Geerpc-Servers", strings.Join(r.aliveServers(), ","))
+        case "POST": // 添加服务实例或发送心跳 承载在HTTP Header中 —— X-Geerpc-Server
+            addr := req.Header.Get("X-Geerpc-Server")
+            if addr == "" {
+                w.WriteHeader(http.StatusInternalServerError)
+                return
+            }
+            r.putServer(addr)
+        default:
+            w.WriteHeader(http.StatusMethodNotAllowed)
+        }
+    }
+```
+
+采用HTTP协议提供服务，所有有用的信息都承载在HTTP Header中。HTTP Header中的信息以键值对的形式。
+
+1. GET方法：返回所有可用的服务列表，通过自定义字段X-Geerpc-Servers承载
+2. POST方法：添加服务实例或发送心跳，通过自定义字段X-Geerpc-Server承载
+
+```go
+    // 便于服务启动定时向注册中心发送心跳 默认周期比注册中心设置的过期时间少1min
+    func Heartbeat(registry, addr string, duration time.Duration) {
+        if duration == 0 {
+            duration = defaultTimeout - time.Duration(1)*time.Minute
+        }
+        var err error
+        err = sendHeartbeat(registry, addr)
+        go func() {
+            t := time.NewTicker(duration) // 定时计时器
+            for err == nil {
+                <-t.C
+                err = sendHeartbeat(registry, addr)
+            }
+        }()
+    }
+
+    func sendHeartbeat(registry, addr string) error {
+        log.Println(addr, "send heart beat to registry", registry)
+        httpClient := &http.Client{}
+        req, _ := http.NewRequest("POST", registry, nil)
+        req.Header.Set("X-Geerpc-Server", addr)
+        // http.Client.Do：发现HTTP请求并返回一个HTTP响应
+        if _, err := httpClient.Do(req); err != nil {
+            log.Println("rpc server: heat beat err:", err)
+            return err
+        }
+        return nil
+    }
+```
+
+注册中心提供```Heartbeat```方法供服务实例调用，其中开启一个goroutine定时调用```sendHeartbeat```向注册中心发起注册服务的请求。
+
+### 基于注册中心的服务发现
+
+```go
+    /* 基于注册中心的服务发现 */
+    type GeeRegistryDiscovery struct {
+        *MultiServerDiscovery
+        registry   string        // 注册中心地址
+        timeout    time.Duration // 服务实例的过期时间
+        lastUpdate time.Time     // 最后从注册中心获取服务列表的时间 默认每隔10s从注册中心获取
     }
 
     // 手工维护服务列表，不需要注册中心的服务发现结构体
@@ -26,183 +136,133 @@
         servers []string
         index   int // 用于轮询策略 记录已经轮询到的位置
     }
-
-    func NewMultiServerDiscovery(servers []string) *MultiServerDiscovery {
-        d := &MultiServerDiscovery{
-            servers: servers,
-            r:       rand.New(rand.NewSource(time.Now().UnixNano())),
-        }
-        d.index = d.r.Intn(math.MaxInt32 - 1) // 初始化一个随机值 避免每次从0开始
-        return d
-    }
 ```
 
-定义一个服务发现的接口类型，以及一个暂时无注册中心的服务发现结构体，人工维护服务列表。
-定义了两种简单的负载均衡策略：选举选取和轮询。
-
-服务发现接口的四个方法实现都很简单。
+```GeeRegistryDiscovery```是基于注册中心实现服务发现的结构体，继承了之前实现的手工维护服务列表的服务发现结构体，以便于复用一些属性和方法。
+```GeeRegistryDiscovery```维护了一个```lastUpdate```属性，表示最后从注册中心获取服务列表的时间，这是一种折中的策略，避免每次客户端指向RPC调用都要从注册中心获取服务实例再进行选举，也防止注册中心中可用的服务实例列表改变。
 
 ```go
-    func (d *MultiServerDiscovery) Refresh() error {
-        return nil
-    }
-
-    func (d *MultiServerDiscovery) Update(servers []string) error {
+    func (d *GeeRegistryDiscovery) Update(servers []string) error {
         d.mu.Lock()
         defer d.mu.Unlock()
-        d.servers = servers // slice非线程安全
+        d.servers = servers
+        d.lastUpdate = time.Now()
         return nil
     }
 
-    func (d *MultiServerDiscovery) Get(mode SelectMode) (string, error) {
-        d.mu.RLock() // 并发情况下slice非线程安全
-        defer d.mu.RUnlock()
-
-        n := len(d.servers)
-        if n == 0 {
-            return "", errors.New("rpc discovery: no available servers")
+    func (d *GeeRegistryDiscovery) Refresh() error {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        if d.lastUpdate.Add(d.timeout).After(time.Now()) { // 未超时
+            return nil
         }
-        switch mode {
-        case RandomSelect:
-            return d.servers[d.r.Intn(n)], nil
-        case RoundRobinSelect:
-            s := d.servers[d.index%n]
-            d.index = (d.index + 1) % n
-            return s, nil
-        default:
-            return "", errors.New("rpc discovery: not supported select mode")
+        log.Println("rpc registry: refresh servers from registry", d.registry)
+        resp, err := http.Get(d.registry)
+        if err != nil {
+            log.Println("rpc registry refresh err:", err)
+            return err
         }
-    }
-
-    func (d *MultiServerDiscovery) GetAll() ([]string, error) {
-        d.mu.RLock()
-        defer d.mu.RUnlock()
-
-        servers := make([]string, len(d.servers), len(d.servers))
-        copy(servers, d.servers)
-        return servers, nil
-    }
-```
-
-因为暂时没设计注册中心，所以没有实现```Refresh```方法的具体逻辑。
-
-### 客户端的设计
-
-```go
-    type XClient struct { // 支持负载均衡的客户端	———— 复用了geerpc.Client的功能
-        d       Discovery
-        mode    SelectMode
-        opt     *Option
-        mu      sync.Mutex
-        clients map[string]*Client // 复用已创建好的连接 实例地址 - 对应的客户端
-    }
-```
-
-一个支持负载均衡的客户端需要维护负载均衡策略以及每个实例对应的客户端，以便于复用。
-
-```go
-    // 创建客户端
-    func (xc *XClient) dial(rpcAddr string) (*Client, error) {
-        xc.mu.Lock()
-        defer xc.mu.Unlock()
-
-        client, ok := xc.clients[rpcAddr]
-        if ok && !client.IsAvailable() { // 客户端不可用
-            _ = client.Close()
-            delete(xc.clients, rpcAddr)
-            client = nil
-        }
-        if client == nil {
-            var err error
-            client, err = XDial(rpcAddr, xc.opt)
-            if err != nil {
-                return nil, err
+        servers := strings.Split(resp.Header.Get("X-Geerpc-Servers"), ",")
+        d.servers = make([]string, 0, len(servers))
+        for _, server := range servers {
+            if s := strings.TrimSpace(server); s != "" { // TrimSpace去掉字符串首尾的空格
+                d.servers = append(d.servers, s)
             }
-            xc.clients[rpcAddr] = client
         }
-        return client, nil
+        d.lastUpdate = time.Now()
+        return nil
     }
 
-    func (xc *XClient) call(rpcAddr string, ctx context.Context, serviceMethod string, args, reply interface{}) error {
-        client, err := xc.dial(rpcAddr)
-        if err != nil {
-            return err
+    // 获取服务实例之前需要先调用Refresh确保实例没过期
+    func (d *GeeRegistryDiscovery) Get(mode SelectMode) (string, error) {
+        if err := d.Refresh(); err != nil {
+            return "", err
         }
-        return client.Call(ctx, serviceMethod, args, reply)
+        return d.MultiServerDiscovery.Get(mode)
     }
 
-    func (xc *XClient) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-        rpcAddr, err := xc.d.Get(xc.mode)
-        if err != nil {
-            return err
+    func (d *GeeRegistryDiscovery) GetAll() ([]string, error) {
+        if err := d.Refresh(); err != nil {
+            return nil, err
         }
-        return xc.call(rpcAddr, ctx, serviceMethod, args, reply)
+        return d.MultiServerDiscovery.GetAll()
     }
 ```
 
-通过```XClient.dial```方法创建连接指定地址的RPC客户端，复用了```geerpc.Client```。当客户端不可用时调用创建```geerpc.Client```的方法创建新客户端并存储在```XClient```中。
+作为一个服务发现接口需要实现上面四个方法。
+```Refresh```方法首先检查距离上次从注册中心获取服务实例是否超时，是的话则重新获取。通过```http.Get(url)```直接发送HTTP请求。
+
+### 使用方法
 
 ```go
-    // 并发向所有实例调用指定的方法
-    func (xc *XClient) Broadcast(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-        servers, err := xc.d.GetAll()
+    func startRegistry(wg *sync.WaitGroup) {
+        l, _ := net.Listen("tcp", ":9999")
+        registry.HandleHTTP()
+        wg.Done()
+        _ = http.Serve(l, nil)
+    }
+```
+
+注册中心通过开启HTTP服务启动。
+
+```go
+    func startServer(registryAddr string, wg *sync.WaitGroup) {
+        var foo Foo
+        l, err := net.Listen("tcp", ":0")
         if err != nil {
-            return err
+            log.Fatal("network error: ", err)
         }
+        server := geerpc.NewServer()
+        if err := server.Register(foo); err != nil {
+            log.Fatal("register error: ", err)
+        }
+        log.Println("start rpc server on", l.Addr())
+        registry.Heartbeat(registryAddr, "tcp@"+l.Addr().String(), 0)
+        wg.Done()
+        server.Accept(l)
+    }
+```
 
+创建服务实例后在服务器注册提供RPC方法的结构体，然后调用注册中心的心跳方法开始向注册中心发送心跳请求，同时注册服务。
+
+```go
+    func call(registry string) {
+        d := xclient.NewGeeRegistryDiscovery(registry, 0)
+        xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
+        defer xc.Close()
         var wg sync.WaitGroup
-        var mu sync.Mutex
-        var e error
-        replyDone := reply == nil
-
-        ctx, cancel := context.WithCancel(ctx) // 借助 context.WithCancel 确保有错误发生时，快速通知其他使用了context的实例
-        for _, rpcAddr := range servers {
+        for i := 0; i < 5; i++ {
             wg.Add(1)
-            go func(rpcAddr string) {
+            go func(i int) {
                 defer wg.Done()
-                var clonedReply interface{}
-                if reply != nil {
-                    clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
-                }
-                err := xc.call(rpcAddr, ctx, serviceMethod, args, clonedReply)
-                mu.Lock()
-                if err != nil && e == nil { // 遇到错误则取消其他执行调用
-                    e = err
-                    cancel()
-                }
-                if err == nil && !replyDone { // 只返回其中一个成功的调用的返回值
-                    reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
-                    replyDone = true
-                }
-                mu.Unlock()
-            }(rpcAddr)
+                var reply int
+                err = xc.Call(context.Background(), "Foo.Sum",  &Args{Num1: i, Num2: i * i}, &reply)
+            }(i)
         }
         wg.Wait()
-        return e
     }
 ```
 
-为```XClient```添加一个常用的功能```Broadcast```。该方法将同一个请求广播给所有服务器实例，当任意一个实例处理请求出错时返回错误并通过```context.WithCancel```生成的```CancelFunc```函数cancel来通知用了同一个context的其他实例结束处理请求。若请求得到成功处理，则返回任一成功处理的结果。
-
-由于参数```reply```是一个interface{}类型的指针，所以每个实例在执行RPC调用时需要先根据reply构造一个针对该实例的reply：```clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()```。在为reply赋值时也同样采用反射的方式：```reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())```。不能够用```reply = clonedReply```代替。
-
-我的推测是：
-如果直接```reply = clonedReply```，由于两个变量都是指针，而clonedReply是在goroutine中定义的，可能clonedReply所指向的空间在goroutine释放时也被释放了，这样做会导致reply最终指向一块未知内容的空间。
+客户端方面，首先创建一个基于注册中心的服务发现结构体，再用这个结构体创建有负载均衡功能的客户端。之后直接调用```Call``方法进行RPC调用即可。
 
 ```go
-    func fc(reply *int) {
-        go func() {
-            clone := new(int)
-            *clone = 5
-            reply = clone
-        }()
-    }
-
     func main() {
-        reply := new(int)
-        fc(reply)
-        fmt.Println(*reply)
+        registryAddr := "http://localhost:9999/_geerpc_/registry"
+        var wg sync.WaitGroup
+        wg.Add(1)
+        go startRegistry(&wg)
+        wg.Wait()
+
+        time.Sleep(time.Second)
+
+        wg.Add(2)
+        go startServer(registryAddr, &wg)
+        go startServer(registryAddr, &wg)
+        wg.Wait()
+
+        time.Sleep(time.Second)
+        call(registryAddr)
     }
 ```
 
-上面代码执行结果是打印了0。印证了不可以直接```reply = clonedReply```。
+总体运行方式如上，用```WaitGroup```确保注册中心先启动服务，然后服务器再进行注册服务，然后客户端才可以进行RPC调用。
